@@ -1,0 +1,11 @@
+[package]
+name = "binary"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num_enum = "0.5.7"
+tokio = { version = "1.14.1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-byteorder = "0.3.0"
