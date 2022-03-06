@@ -1,10 +1,13 @@
 #![warn(rust_2018_idioms)]
 
+extern crate core;
+
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::io::Error as IoError;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use tokio::io::BufStream;
@@ -27,6 +30,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     server.run(listener).await
 }
 
+#[derive(Clone)]
+struct Entry {
+    value: Vec<u8>,
+    flags: u32,
+    expire: Option<Instant>,
+}
+
 struct Server {}
 
 impl Server {
@@ -35,7 +45,7 @@ impl Server {
     }
 
     async fn run(&mut self, listener: TcpListener) -> Result<(), Box<dyn Error>> {
-        let kvs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let kvs: HashMap<Vec<u8>, Entry> = HashMap::new();
         let kvs = Arc::new(Mutex::new(kvs));
 
         loop {
@@ -46,13 +56,12 @@ impl Server {
             tokio::spawn(async move {
                 let r = async {
                     loop {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        use tokio::io::{AsyncReadExt};
 
                         let req_header = match read_request_header(&mut stream).await {
                             Err(e) => return Err::<(), Box<dyn Error>>(Box::new(e)),
                             Ok(header) => header
                         };
-                        println!("read request header {:?}", req_header);
 
                         let extra_len = req_header.extras_length.into();
                         let key_len = req_header.key_length.into();
@@ -91,11 +100,29 @@ impl Server {
                                 };
 
                                 match result {
-                                    Some(value) => {
-                                        res_header.status = ResponseStatus::NoError.into();
-                                        res_header.total_body_length = u32::try_from(value.len()).unwrap_or(0);
-                                        write_response_header(&mut stream, &res_header).await?;
-                                        stream.write_all(value.as_slice()).await?;
+                                    Some(entry) => {
+                                        let valid = entry.expire.map(|t| t > Instant::now()).unwrap_or(true);
+                                        if valid {
+                                            res_header.status = ResponseStatus::NoError.into();
+                                            res_header.extras_length = 4;
+                                            res_header.total_body_length = 4 + u32::try_from(entry.value.len()).unwrap_or(0);
+                                            write_response_header(&mut stream, &res_header).await?;
+                                            {
+                                                use tokio_byteorder::AsyncWriteBytesExt;
+                                                stream.write_u32::<BigEndian>(entry.flags).await?;
+                                            }
+                                            {
+                                                use tokio::io::AsyncWriteExt;
+                                                stream.write_all(entry.value.as_slice()).await?;
+                                            }
+                                        } else {
+                                            {
+                                                // remove expire value
+                                                kvs.lock().unwrap().remove(key_buff.as_slice());
+                                            }
+                                            res_header.status = ResponseStatus::KeyNotFound.into();
+                                            write_response_header(&mut stream, &res_header).await?;
+                                        }
                                     }
                                     None => {
                                         res_header.status = ResponseStatus::KeyNotFound.into();
@@ -104,7 +131,19 @@ impl Server {
                                 };
                             }
                             Ok(CommandOpcodes::Set) => {
-                                kvs.lock().unwrap().insert(key_buff, value_buff);
+                                let mut entry = Entry {
+                                    value: value_buff,
+                                    flags: 0,
+                                    expire: None,
+                                };
+                                if extra_buff.len() == 8 {
+                                    let flags: [u8; 4] = (&extra_buff[0..4]).try_into().unwrap();
+                                    entry.flags = u32::from_be_bytes(flags);
+                                    let expire: [u8; 4] = (&extra_buff[4..8]).try_into().unwrap();
+                                    let duration = Duration::from_secs(u32::from_be_bytes(expire).into());
+                                    entry.expire = if duration.is_zero() { None } else { Some(Instant::now() + duration) };
+                                }
+                                kvs.lock().unwrap().insert(key_buff, entry);
                                 res_header.status = ResponseStatus::NoError.into();
                                 write_response_header(&mut stream, &res_header).await?;
                             }
@@ -124,7 +163,7 @@ impl Server {
                                     let mut k = kvs.lock()?;
                                     match k.get_mut(key_buff.as_slice()) {
                                         Some(current) => {
-                                            current.append(&mut value_buff);
+                                            current.value.append(&mut value_buff);
                                             true
                                         }
                                         None => false
@@ -142,7 +181,8 @@ impl Server {
                                     let mut k = kvs.lock()?;
                                     match k.get_mut(key_buff.as_slice()) {
                                         Some(current) => {
-                                            value_buff.append(current);
+                                            value_buff.append(&mut current.value);
+                                            current.value = value_buff;
                                             true
                                         }
                                         None => false
@@ -159,7 +199,12 @@ impl Server {
                                 let stored = {
                                     let mut k = kvs.lock()?;
                                     if k.contains_key(key_buff.as_slice()) {
-                                        k.insert(key_buff, value_buff);
+                                        let entry = Entry {
+                                            value: value_buff,
+                                            flags: 0,
+                                            expire: None,
+                                        };
+                                        k.insert(key_buff, entry);
                                         true
                                     } else {
                                         false
@@ -178,7 +223,12 @@ impl Server {
                                     if k.contains_key(key_buff.as_slice()) {
                                         false
                                     } else {
-                                        k.insert(key_buff, value_buff);
+                                        let entry = Entry {
+                                            value: value_buff,
+                                            flags: 0,
+                                            expire: None,
+                                        };
+                                        k.insert(key_buff, entry);
                                         true
                                     }
                                 };
@@ -195,7 +245,10 @@ impl Server {
                             }
                         }
 
-                        stream.flush().await?;
+                        {
+                            use tokio::io::AsyncWriteExt;
+                            stream.flush().await?;
+                        }
                     }
                 };
                 match r.await {
